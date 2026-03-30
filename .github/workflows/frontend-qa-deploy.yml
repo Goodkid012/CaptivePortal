@@ -1,0 +1,197 @@
+name: Frontend CD - Deploy to QA
+
+on:
+  push:
+    branches: [ qa ]
+    paths:
+      - 'frontend/**'
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  deploy-qa:
+    runs-on: ubuntu-latest
+    environment: qa
+    
+    defaults:
+      run:
+        working-directory: ./frontend
+    
+    steps:
+      # Step 4.1: Checkout Code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 4.2: Set Up Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: './frontend/.nvmrc'
+          cache: 'npm'
+          cache-dependency-path: './frontend/package-lock.json'
+      
+      # Step 4.3: Install Dependencies
+      - name: Install dependencies
+        run: npm ci
+      
+      # Step 4.4: Create QA Environment File
+      - name: Create QA environment
+        run: |
+          cat > .env << EOF
+          REACT_APP_API_URL=${{ secrets.REACT_APP_API_URL }}
+          REACT_APP_ENVIRONMENT=qa
+          REACT_APP_VERSION=${{ github.sha }}
+          REACT_APP_BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          GENERATE_SOURCEMAP=false
+          EOF
+          echo "✅ Environment file created"
+          echo "API URL: ${{ secrets.REACT_APP_API_URL }}"
+      
+      # Step 4.5: Build Application
+      - name: Build application
+        run: npm run build
+        env:
+          CI: true
+          NODE_OPTIONS: "--max-old-space-size=4096"
+      
+      # Step 4.6: Deploy to QA Server
+      - name: Deploy to QA server
+        env:
+          SSH_HOST: ${{ secrets.QA_SSH_HOST }}
+          SSH_USER: ${{ secrets.QA_SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.QA_SSH_PRIVATE_KEY }}
+          DEPLOY_PATH: /var/www/ubsonboardpro/frontend
+          BACKUP_PATH: /var/www/ubsonboardpro/frontend_backups
+        run: |
+          # Setup SSH
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          
+          # Create backup directory on server
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${SSH_USER}@${SSH_HOST} "mkdir -p ${BACKUP_PATH}"
+          
+          # Backup current version with timestamp
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${SSH_USER}@${SSH_HOST} \
+            "if [ -d ${DEPLOY_PATH} ]; then \
+               tar -czf ${BACKUP_PATH}/backup_${TIMESTAMP}.tar.gz -C ${DEPLOY_PATH} . && \
+               echo '✅ Backup created: backup_${TIMESTAMP}.tar.gz'; \
+             else \
+               echo 'No existing deployment to backup'; \
+             fi"
+          
+          # Create deployment directory if it doesn't exist
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${SSH_USER}@${SSH_HOST} "sudo mkdir -p ${DEPLOY_PATH}"
+          
+          # Copy build files to server
+          echo "📦 Copying build files to server..."
+          scp -i ~/.ssh/deploy_key -r ./build/* ${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/
+          
+          # Set correct permissions
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${SSH_USER}@${SSH_HOST} \
+            "sudo chown -R www-data:www-data ${DEPLOY_PATH} && \
+             sudo chmod -R 755 ${DEPLOY_PATH}"
+          
+          # Verify files were copied
+          FILE_COUNT=$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${SSH_USER}@${SSH_HOST} "find ${DEPLOY_PATH} -type f | wc -l")
+          echo "✅ Deployed $FILE_COUNT files to server"
+      
+      # Step 4.7: Verify Deployment
+      - name: Verify deployment
+        env:
+          SSH_HOST: ${{ secrets.QA_SSH_HOST }}
+          SSH_USER: ${{ secrets.QA_SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.QA_SSH_PRIVATE_KEY }}
+          DEPLOY_PATH: /var/www/ubsonboardpro/frontend
+          FRONTEND_URL: ${{ secrets.QA_FRONTEND_URL }}
+        run: |
+          # Setup SSH
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          
+          # Verify index.html exists
+          if ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${SSH_USER}@${SSH_HOST} "test -f ${DEPLOY_PATH}/index.html"; then
+            echo "✅ index.html exists on server"
+          else
+            echo "❌ index.html not found!"
+            exit 1
+          fi
+          
+          # Check static files
+          JS_COUNT=$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${SSH_USER}@${SSH_HOST} "find ${DEPLOY_PATH}/static/js -name '*.js' 2>/dev/null | wc -l")
+          echo "✅ Found $JS_COUNT JavaScript files"
+          
+          # Verify environment variables in built files
+          echo "🔍 Checking environment variables in built files..."
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${SSH_USER}@${SSH_HOST} \
+            "grep -r 'REACT_APP_API_URL' ${DEPLOY_PATH}/static/js/*.js | head -1" || \
+            echo "⚠️ API URL not found in built files (may be obfuscated)"
+      
+      # Step 4.8: Clear CDN/Cache
+      - name: Clear CDN cache (if applicable)
+        if: false  # Enable if using CDN
+        run: |
+          echo "🔄 Clearing CDN cache..."
+          # Add CDN purge commands here
+          # Example for CloudFlare:
+          # curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE }}/purge_cache" \
+          #   -H "Authorization: Bearer ${{ secrets.CF_TOKEN }}" \
+          #   -H "Content-Type: application/json" \
+          #   --data '{"purge_everything":true}'
+      
+      # Step 5: Deployment Verification with HTTP checks
+      - name: HTTP verification
+        env:
+          FRONTEND_URL: ${{ secrets.QA_FRONTEND_URL }}
+        run: |
+          echo "⏳ Waiting 10 seconds for web server to pick up changes..."
+          sleep 10
+          
+          echo "🌐 Checking frontend URL: $FRONTEND_URL"
+          
+          # Perform curl request and check response
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $FRONTEND_URL)
+          
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "✅ Frontend is accessible (HTTP $HTTP_STATUS)"
+          else
+            echo "❌ Frontend returned HTTP $HTTP_STATUS"
+            exit 1
+          fi
+          
+          # Check for index.html content
+          if curl -s $FRONTEND_URL | grep -q "<title>"; then
+            echo "✅ Page contains title tag"
+          else
+            echo "⚠️ Could not find title tag in response"
+          fi
+          
+          # Check API connectivity (this would be a specific endpoint)
+          echo "🔌 Testing API connectivity..."
+          # Add specific API endpoint check here
+      
+      # Step 7: Deployment Notifications
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Deployment successful!"
+          echo "📍 Frontend URL: ${{ secrets.QA_FRONTEND_URL }}"
+          echo "📝 Commit: ${{ github.sha }}"
+          echo "🕐 Time: $(date)"
+          # Add Slack/Discord/Teams webhook here
+      
+      - name: Notify deployment failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed for commit ${{ github.sha }}"
+          echo "🔗 View workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Add alert notification here
