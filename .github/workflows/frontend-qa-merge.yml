@@ -1,0 +1,99 @@
+name: Frontend CI - QA Validation
+
+on:
+  pull_request:
+    branches: [ qa ]
+    paths:
+      - 'frontend/**'
+  push:
+    branches: [ qa ]
+    paths:
+      - 'frontend/**'
+
+jobs:
+  validate-qa:
+    runs-on: ubuntu-latest
+    
+    defaults:
+      run:
+        working-directory: ./frontend
+    
+    steps:
+      # Step 4.1: Checkout Code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 4.2: Set Up Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: './frontend/.nvmrc'
+          cache: 'npm'
+          cache-dependency-path: './frontend/package-lock.json'
+      
+      # Step 4.3: Install Dependencies
+      - name: Install dependencies
+        run: npm ci
+      
+      # Step 4.4: Create QA Environment File
+      - name: Create QA environment file
+        run: |
+          cat > .env << EOF
+          REACT_APP_API_URL=https://qa-api.ubsonboardpro.com
+          REACT_APP_ENVIRONMENT=qa
+          REACT_APP_VERSION=${{ github.sha }}
+          GENERATE_SOURCEMAP=false
+          EOF
+          cat .env
+      
+      # Step 4.5: Build with QA Configuration
+      - name: Build with QA config
+        run: npm run build
+        env:
+          CI: true
+      
+      # Step 4.6: Validate Build Output
+      - name: Validate build output
+        run: |
+          if [ ! -f "build/index.html" ]; then
+            echo "❌ build/index.html not found!"
+            exit 1
+          fi
+          echo "✅ index.html exists"
+          
+          if [ ! -d "build/static" ]; then
+            echo "❌ static assets not found!"
+            exit 1
+          fi
+          echo "✅ static assets found"
+          
+          # Check for JS and CSS files
+          JS_COUNT=$(find build/static/js -name "*.js" 2>/dev/null | wc -l)
+          CSS_COUNT=$(find build/static/css -name "*.css" 2>/dev/null | wc -l)
+          echo "✅ Found $JS_COUNT JS files and $CSS_COUNT CSS files"
+      
+      # Step 4.7: Bundle Analysis
+      - name: Run bundle analysis
+        run: |
+          if [ -f "build/asset-manifest.json" ]; then
+            echo "📦 Bundle Analysis:"
+            cat build/asset-manifest.json | jq '.files | to_entries[] | {key: .key, size: .value}' || true
+          fi
+          
+          # Check total build size
+          BUILD_SIZE=$(du -sh build/ | cut -f1)
+          echo "📦 Total build size: $BUILD_SIZE"
+          
+          # Alert if build > 5MB (adjust threshold as needed)
+          if [[ $(du -sb build/ | cut -f1) -gt 5242880 ]]; then
+            echo "⚠️ Warning: Build size exceeds 5MB"
+          fi
+      
+      # Upload artifact for debugging
+      - name: Upload QA build
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-build-qa-validation
+          path: ./frontend/build/
+          retention-days: 3
